@@ -1,3 +1,16 @@
 ../shopping-cart/frontend/node_modules/
 ../shopping-cart/frontend/dist/
 ../shopping-cart/.aws-sam/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node
+engine-frontend/node_modules/
+engine-frontend/dist/
+
+# Local env
+.env
+.env.local
