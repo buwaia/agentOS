@@ -1,0 +1,537 @@
+openapi: "3.1.0"
+
+info:
+  title: Math Solver — Delivery Engine API
+  version: "1.0.0"
+  description: |
+    数学解题 Delivery Engine，独立服务，部署于 AWS Lambda + API Gateway。
+
+    ## 设计原则
+
+    引擎不是一个同步的"输入题目→输出答案"接口。
+    原因：ORIENT 阶段的 G2 是**人工 Gate**——
+    "选定路径是否有直觉性依据"无法自动判断（P1: 洞见优先）。
+
+    因此引擎采用**异步状态机**：每道题是一个 Job，
+    按阶段推进，G2 需要人工调用 approve 才能过关。
+
+    ## 阶段序列
+
+    ```
+    UNDERSTAND → ORIENT → SOLVE → VERIFY → DONE
+                   ↑
+              G2: 人工 Gate
+    ```
+
+    ## Gate 说明
+
+    | Gate | 阶段出口          | 类型   | 触发方式       |
+    |------|-------------------|--------|----------------|
+    | G1   | UNDERSTAND→ORIENT | 自动   | POST /advance  |
+    | G2   | ORIENT→SOLVE      | 人工   | POST /approve  |
+    | G3   | SOLVE→VERIFY      | 半自动 | POST /advance  |
+    | G4   | VERIFY→DONE       | 自动   | POST /advance  |
+
+servers:
+  - url: https://{api_id}.execute-api.{region}.amazonaws.com/prod
+    description: AWS API Gateway (Production)
+    variables:
+      api_id:
+        default: "your-api-id"
+      region:
+        default: "ap-northeast-1"
+  - url: http://localhost:8000
+    description: Local FastAPI dev server
+
+paths:
+
+  # ─────────────────────────────────────────
+  # Job 生命周期
+  # ─────────────────────────────────────────
+
+  /jobs:
+    post:
+      operationId: createJob
+      summary: 提交一道数学题，创建解题 Job，自动进入 UNDERSTAND 阶段
+      tags: [Job]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateJobRequest"
+            example:
+              problem: "证明 ln((a+b)/2) ≥ (ln a + ln b)/2，其中 a, b > 0"
+              problem_type: "inequality_proof"
+      responses:
+        "201":
+          description: Job 创建成功，UNDERSTAND 阶段已启动（Bedrock 异步识别中）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /jobs/{job_id}:
+    get:
+      operationId: getJob
+      summary: 查询 Job 当前阶段和状态
+      tags: [Job]
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ─────────────────────────────────────────
+  # 阶段推进（自动 Gate：G1 / G3 / G4）
+  # ─────────────────────────────────────────
+
+  /jobs/{job_id}/advance:
+    post:
+      operationId: advanceStage
+      summary: 提交当前阶段产出物，触发自动 Gate，通过则推进到下一阶段
+      description: |
+        适用于 G1（UNDERSTAND→ORIENT）、G3（SOLVE→VERIFY）、G4（VERIFY→DONE）。
+
+        **G2（ORIENT→SOLVE）走 /approve，不走本接口。**
+
+        Gate 校验逻辑：
+        - G1：solve_goal 非空 且 confidence ≥ 0.8
+        - G3：steps 完整（每步有 reason）且 intuition_explanation 非空
+        - G4：所有 verification_cases 的 passed = true 且 quality_check.has_intuition = true
+      tags: [Stage]
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdvanceRequest"
+      responses:
+        "200":
+          description: Gate 通过，已推进
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "409":
+          description: Gate 未通过
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GateFailure"
+              examples:
+                g1_low_confidence:
+                  summary: G1 — confidence 不足
+                  value:
+                    gate: "G1"
+                    reason: "confidence 0.63 < 0.8"
+                    action: "标记 BLOCKED，等待人工确认题目理解"
+                g3_missing_intuition:
+                  summary: G3 — 缺直觉解释
+                  value:
+                    gate: "G3"
+                    reason: "intuition_explanation 为空"
+                    action: "补充函数结果的直觉解释后重新提交（R5）"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ─────────────────────────────────────────
+  # 人工审批（G2 专用）
+  # ─────────────────────────────────────────
+
+  /jobs/{job_id}/approve:
+    post:
+      operationId: approveOrient
+      summary: 人工审批 G2——判断 ORIENT 选定路径是否有直觉性依据（P1）
+      description: |
+        G2 是本引擎唯一的人工 Gate。
+
+        审批人判断 ORIENT 产出物中 selected_path 的 intuition_basis 是否满足 P1：
+        - **通过**：路径有几何类比 / 直觉描述 → 推进到 SOLVE
+        - **拒绝**：路径是纯公式推导，缺乏直觉 → 退回 ORIENT，等待修订
+
+        典型通过案例：「半圆垂线 ≤ 半径，几何事实直接给出结论」
+        典型拒绝案例：「令 f(x)=ln x，f''(x)<0，调用 Jensen 不等式」（机械，无直觉）
+      tags: [Stage]
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApproveRequest"
+            examples:
+              pass:
+                value:
+                  approved: true
+                  reviewer_id: "teacher-001"
+                  comment: "半圆几何路径直觉清晰，通过"
+              reject:
+                value:
+                  approved: false
+                  reviewer_id: "teacher-001"
+                  comment: "路径 A 是纯公式，退回修订"
+      responses:
+        "200":
+          description: 审批完成（通过 → SOLVE，拒绝 → 回 ORIENT）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "409":
+          description: 当前阶段不是 ORIENT 或不处于 waiting_approval 状态
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ─────────────────────────────────────────
+  # 产出物
+  # ─────────────────────────────────────────
+
+  /jobs/{job_id}/artifacts/{stage}:
+    get:
+      operationId: getArtifact
+      summary: 获取指定阶段的产出物
+      tags: [Artifact]
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+        - name: stage
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/Stage"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+# ─────────────────────────────────────────
+# Components
+# ─────────────────────────────────────────
+
+components:
+
+  parameters:
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema:
+        type: string
+        example: "job-20260628-abc123"
+
+  schemas:
+
+    Stage:
+      type: string
+      enum: [UNDERSTAND, ORIENT, SOLVE, VERIFY, DONE, BLOCKED]
+
+    JobStatus:
+      type: string
+      enum: [running, waiting_approval, blocked, done]
+      description: |
+        - running: 当前阶段自动处理中或等待 advance
+        - waiting_approval: ORIENT 完成，等待 G2 人工审批
+        - blocked: G1 confidence < 0.8，等待人工确认题目理解
+        - done: G4 通过，解答可交付
+
+    Job:
+      type: object
+      required: [job_id, status, current_stage, created_at]
+      properties:
+        job_id:
+          type: string
+        problem:
+          type: string
+          description: 原始题目文本
+        status:
+          $ref: "#/components/schemas/JobStatus"
+        current_stage:
+          $ref: "#/components/schemas/Stage"
+        gate_history:
+          type: array
+          items:
+            $ref: "#/components/schemas/GateRecord"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    GateRecord:
+      type: object
+      properties:
+        gate:
+          type: string
+          enum: [G1, G2, G3, G4]
+        type:
+          type: string
+          enum: [auto, manual]
+        result:
+          type: string
+          enum: [passed, failed]
+        reviewer_id:
+          type: string
+          description: G2 专用
+        comment:
+          type: string
+        checked_at:
+          type: string
+          format: date-time
+
+    # ── 请求体 ──
+
+    CreateJobRequest:
+      type: object
+      required: [problem]
+      properties:
+        problem:
+          type: string
+          description: 题目文本（已识别为文字，非图片）
+        problem_type:
+          type: string
+          enum: [algebra, geometry, function, inequality_proof, combinatorics, other]
+          default: other
+
+    AdvanceRequest:
+      type: object
+      required: [stage, payload]
+      properties:
+        stage:
+          $ref: "#/components/schemas/Stage"
+          description: 当前要提交产出物的阶段（用于校验防错）
+        payload:
+          $ref: "#/components/schemas/StagePayload"
+
+    ApproveRequest:
+      type: object
+      required: [approved, reviewer_id]
+      properties:
+        approved:
+          type: boolean
+        reviewer_id:
+          type: string
+        comment:
+          type: string
+
+    # ── 各阶段产出物 ──
+
+    StagePayload:
+      description: 按 stage 解释对应字段
+      oneOf:
+        - $ref: "#/components/schemas/UnderstandPayload"
+        - $ref: "#/components/schemas/OrientPayload"
+        - $ref: "#/components/schemas/SolvePayload"
+        - $ref: "#/components/schemas/VerifyPayload"
+      discriminator:
+        propertyName: stage
+
+    UnderstandPayload:
+      type: object
+      required: [stage, problem_type, known_conditions, solve_goal, confidence]
+      properties:
+        stage:
+          type: string
+          enum: [UNDERSTAND]
+        problem_type:
+          type: string
+        known_conditions:
+          type: array
+          items:
+            type: string
+          minItems: 1
+        solve_goal:
+          type: string
+          description: "G1 校验：非空，用一句话说清楚求什么"
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: "G1 校验：< 0.8 → BLOCKED"
+
+    OrientPayload:
+      type: object
+      required: [stage, candidate_paths, selected_path_id, selection_rationale]
+      properties:
+        stage:
+          type: string
+          enum: [ORIENT]
+        candidate_paths:
+          type: array
+          minItems: 2
+          items:
+            $ref: "#/components/schemas/CandidatePath"
+          description: 至少给出 2 条路径
+        selected_path_id:
+          type: string
+        selection_rationale:
+          type: string
+          description: "G2 人工校验：为什么选这条路径，必须有直觉性描述（P1）"
+
+    SolvePayload:
+      type: object
+      required: [stage, steps, final_result, intuition_explanation]
+      properties:
+        stage:
+          type: string
+          enum: [SOLVE]
+        steps:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/SolveStep"
+        final_result:
+          type: string
+        intuition_explanation:
+          type: string
+          description: "G3 校验：非空，说清楚'为什么是这个结果'（R5）"
+
+    VerifyPayload:
+      type: object
+      required: [stage, verification_cases, quality_check]
+      properties:
+        stage:
+          type: string
+          enum: [VERIFY]
+        verification_cases:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/VerificationCase"
+        quality_check:
+          $ref: "#/components/schemas/QualityCheck"
+
+    CandidatePath:
+      type: object
+      required: [path_id, description, intuition_basis]
+      properties:
+        path_id:
+          type: string
+        description:
+          type: string
+        intuition_basis:
+          type: string
+          description: 几何类比 / 直觉描述，不能为空字符串（P1）
+
+    SolveStep:
+      type: object
+      required: [step, expression, reason]
+      properties:
+        step:
+          type: integer
+        expression:
+          type: string
+        reason:
+          type: string
+          description: 这一步的直觉解释，禁止空字符串
+
+    VerificationCase:
+      type: object
+      required: [method, input, expected, actual, passed]
+      properties:
+        method:
+          type: string
+          enum: [special_value, boundary, reverse]
+        input:
+          type: string
+        expected:
+          type: string
+        actual:
+          type: string
+        passed:
+          type: boolean
+
+    QualityCheck:
+      type: object
+      required: [has_intuition, all_verifications_passed]
+      properties:
+        has_intuition:
+          type: boolean
+          description: "G4 校验：解析中有几何 / 类比 / 直觉描述（R001）"
+        has_story:
+          type: boolean
+          description: "加分项：解析有叙事感（R4），非必须"
+        all_verifications_passed:
+          type: boolean
+
+    # ── 产出物封装 ──
+
+    Artifact:
+      type: object
+      properties:
+        job_id:
+          type: string
+        stage:
+          $ref: "#/components/schemas/Stage"
+        payload:
+          $ref: "#/components/schemas/StagePayload"
+        gate_result:
+          $ref: "#/components/schemas/GateRecord"
+        created_at:
+          type: string
+          format: date-time
+
+    GateFailure:
+      type: object
+      required: [gate, reason, action]
+      properties:
+        gate:
+          type: string
+          enum: [G1, G2, G3, G4]
+        reason:
+          type: string
+        confidence:
+          type: number
+          description: G1 失败时附带实际值
+        action:
+          type: string
+          description: 建议的修复动作
+
+    ErrorResponse:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+
+  responses:
+    NotFound:
+      description: Job 不存在
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ValidationError:
+      description: 请求参数不合法
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+tags:
+  - name: Job
+    description: 解题 Job 生命周期
+  - name: Stage
+    description: 阶段推进和 Gate 校验
+  - name: Artifact
+    description: 各阶段产出物
