@@ -2,35 +2,60 @@ openapi: "3.1.0"
 
 info:
   title: Math Solver — Delivery Engine API
-  version: "1.0.0"
+  version: "2.0.0"
   description: |
     数学解题 Delivery Engine，独立服务，部署于 AWS Lambda + API Gateway。
 
     ## 设计原则
 
-    引擎不是一个同步的"输入题目→输出答案"接口。
-    原因：ORIENT 阶段的 G2 是**人工 Gate**——
-    "选定路径是否有直觉性依据"无法自动判断（P1: 洞见优先）。
+    引擎是**异步状态机**：每道题是一个 Job，按阶段推进。
+    G2（ORIENT→SOLVE）是人工 Gate，无法自动判断路径是否有直觉性依据。
 
-    因此引擎采用**异步状态机**：每道题是一个 Job，
-    按阶段推进，G2 需要人工调用 approve 才能过关。
-
-    ## 阶段序列
+    ## 阶段序列（标准 Profile）
 
     ```
     UNDERSTAND → ORIENT → SOLVE → VERIFY → DONE
                    ↑
-              G2: 人工 Gate
+              G2: 人工 Gate（L3）
+    ```
+
+    ## shortanswer Profile（简答题跳过 ORIENT）
+
+    ```
+    UNDERSTAND → SOLVE → VERIFY → DONE
     ```
 
     ## Gate 说明
 
-    | Gate | 阶段出口          | 类型   | 触发方式       |
-    |------|-------------------|--------|----------------|
-    | G1   | UNDERSTAND→ORIENT | 自动   | POST /advance  |
-    | G2   | ORIENT→SOLVE      | 人工   | POST /approve  |
-    | G3   | SOLVE→VERIFY      | 半自动 | POST /advance  |
-    | G4   | VERIFY→DONE       | 自动   | POST /advance  |
+    | Gate | 阶段出口           | 类型   | Level | 触发方式      |
+    |------|--------------------|--------|-------|---------------|
+    | G1   | UNDERSTAND→ORIENT  | 自动   | L1    | POST /advance |
+    | G2   | ORIENT→SOLVE       | 人工   | L3    | POST /approve |
+    | G3   | SOLVE→VERIFY       | 自动   | L1    | POST /advance |
+    | G4   | VERIFY→DONE        | 自动   | L1/L2 | POST /advance |
+
+    G4 特殊降级：所有用例通过但 `has_story=false` 时降为 **L2（警告）**，Job 仍推进到 DONE。
+
+    ## Gate Level 说明
+
+    | Level | 失败时行为 |
+    |-------|-----------|
+    | L1    | Job 进入 BLOCKED，必须人工介入 |
+    | L2    | 记录 warning 事件，Job 继续推进 |
+    | L3    | Job 进入 WAITING_APPROVAL，等待人工审批 |
+
+    ## Profile → 阶段路径映射
+
+    | Profile     | 题目类型                              | ORIENT/G2 |
+    |-------------|---------------------------------------|-----------|
+    | proof       | inequality_proof, combinatorics, geometry | 必须      |
+    | calculation | algebra, function, other              | 必须      |
+    | shortanswer | shortanswer                           | 跳过      |
+
+    ## 蒸馏闭环
+
+    每次 Gate 通过/失败都写入 DynamoDB `DISTILL#{date}` 分区。
+    `/drishti` 定期扫描并蒸馏成治理 Rule，形成闭环。
 
 servers:
   - url: https://{api_id}.execute-api.{region}.amazonaws.com/prod
@@ -39,20 +64,35 @@ servers:
       api_id:
         default: "your-api-id"
       region:
-        default: "ap-northeast-1"
+        default: "us-east-1"
   - url: http://localhost:8000
     description: Local FastAPI dev server
 
 paths:
 
-  # ─────────────────────────────────────────
-  # Job 生命周期
-  # ─────────────────────────────────────────
-
   /jobs:
+    get:
+      operationId: listJobs
+      summary: 列出所有 Job（按创建时间倒序）
+      tags: [Job]
+      responses:
+        "200":
+          description: Job 列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Job"
+
     post:
       operationId: createJob
-      summary: 提交一道数学题，创建解题 Job，自动进入 UNDERSTAND 阶段
+      summary: 提交数学题，创建 Job，自动触发 Bedrock UNDERSTAND
+      description: |
+        创建 Job 后，后端立即调用 Bedrock 分析题目（UNDERSTAND 阶段），
+        并根据 `problem_type` 自动选择 Profile：
+        - `shortanswer` → G1 通过后直接进入 SOLVE（跳过 ORIENT/G2）
+        - 其他 → G1 通过后进入 WAITING_APPROVAL，等待 G2 审批
       tags: [Job]
       requestBody:
         required: true
@@ -60,28 +100,50 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/CreateJobRequest"
-            example:
-              problem: "证明 ln((a+b)/2) ≥ (ln a + ln b)/2，其中 a, b > 0"
-              problem_type: "inequality_proof"
+            examples:
+              proof:
+                summary: 证明题（proof profile）
+                value:
+                  problem: "证明 ln((a+b)/2) ≥ (ln a + ln b)/2，其中 a, b > 0"
+                  problem_type: "inequality_proof"
+              shortanswer:
+                summary: 简答题（shortanswer profile，跳过G2）
+                value:
+                  problem: "What is 2+2?"
+                  problem_type: "shortanswer"
       responses:
         "201":
-          description: Job 创建成功，UNDERSTAND 阶段已启动（Bedrock 异步识别中）
+          description: Job 创建成功，UNDERSTAND 已自动执行
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Job"
+              examples:
+                waiting_g2:
+                  summary: proof/calculation — 等待G2审批
+                  value:
+                    job_id: "job-abc123"
+                    status: "waiting_approval"
+                    current_stage: "ORIENT"
+                blocked_g1:
+                  summary: G1 BLOCKED — 题目理解置信度不足
+                  value:
+                    job_id: "job-def456"
+                    status: "blocked"
+                    current_stage: "BLOCKED"
         "422":
           $ref: "#/components/responses/ValidationError"
 
   /jobs/{job_id}:
     get:
       operationId: getJob
-      summary: 查询 Job 当前阶段和状态
+      summary: 查询 Job 当前阶段、状态和 Gate 历史
       tags: [Job]
       parameters:
         - $ref: "#/components/parameters/JobId"
       responses:
         "200":
+          description: Job 详情（含 gate_history）
           content:
             application/json:
               schema:
@@ -89,23 +151,25 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
-  # ─────────────────────────────────────────
-  # 阶段推进（自动 Gate：G1 / G3 / G4）
-  # ─────────────────────────────────────────
-
   /jobs/{job_id}/advance:
     post:
       operationId: advanceStage
-      summary: 提交当前阶段产出物，触发自动 Gate，通过则推进到下一阶段
+      summary: 提交当前阶段产出物，触发自动 Gate（G1/G3/G4）
       description: |
         适用于 G1（UNDERSTAND→ORIENT）、G3（SOLVE→VERIFY）、G4（VERIFY→DONE）。
 
-        **G2（ORIENT→SOLVE）走 /approve，不走本接口。**
+        **注意：ORIENT 阶段（G2）必须使用 /approve 接口，此接口会返回 409。**
 
         Gate 校验逻辑：
-        - G1：solve_goal 非空 且 confidence ≥ 0.8
-        - G3：steps 完整（每步有 reason）且 intuition_explanation 非空
-        - G4：所有 verification_cases 的 passed = true 且 quality_check.has_intuition = true
+        - **G1**：`confidence ≥ 0.8`（L1，失败→BLOCKED）
+        - **G3**：`intuition_explanation` 非空且每步 `reason` 非空（L1，失败→保持SOLVE）
+        - **G4**：所有 `verification_cases.passed=true` 且 `has_intuition=true`（L1）；
+          `has_story=false` 时降为 L2 警告，Job 仍推进到 DONE
+
+        **payload 类型由 `stage` 字段区分：**
+        - `stage=UNDERSTAND` → UnderstandPayload
+        - `stage=SOLVE` → SolvePayload
+        - `stage=VERIFY` → VerifyPayload
       tags: [Stage]
       parameters:
         - $ref: "#/components/parameters/JobId"
@@ -115,52 +179,102 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/AdvanceRequest"
+            examples:
+              solve:
+                summary: 提交 SOLVE 产出物
+                value:
+                  stage: "SOLVE"
+                  payload:
+                    stage: "SOLVE"
+                    steps:
+                      - step: 1
+                        expression: "设 f(x) = ln x - (x-1)，则 f'(x) = 1/x - 1"
+                        reason: "构造辅助函数，分析单调性"
+                      - step: 2
+                        expression: "f'(x) = 0 ⟹ x=1，f(1)=0，f''(1)<0 为极大值"
+                        reason: "唯一极值点处函数值为0，说明整体非正"
+                    final_result: "ln x ≤ x-1 对所有正实数 x 成立"
+                    intuition_explanation: "切线不等式：y=x-1 是 ln x 在 x=1 处的切线，ln 函数图像始终在切线下方"
+              verify:
+                summary: 提交 VERIFY 产出物
+                value:
+                  stage: "VERIFY"
+                  payload:
+                    stage: "VERIFY"
+                    verification_cases:
+                      - method: "special_value"
+                        input: "x=1"
+                        expected: "ln 1 = 0 ≤ 1-1 = 0"
+                        actual: "0 ≤ 0，等号成立"
+                        passed: true
+                      - method: "boundary"
+                        input: "x→0+"
+                        expected: "ln x → -∞ < x-1 → -1"
+                        actual: "左边趋向-∞，右边趋向-1，不等式成立"
+                        passed: true
+                    quality_check:
+                      has_intuition: true
+                      has_story: true
+                      all_verifications_passed: true
       responses:
         "200":
-          description: Gate 通过，已推进
+          description: Gate 通过，已推进到下一阶段（或 L2 警告时推进到 DONE）
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Job"
         "409":
-          description: Gate 未通过
+          description: Gate 未通过（L1 阻断）或阶段不匹配
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/GateFailure"
               examples:
                 g1_low_confidence:
-                  summary: G1 — confidence 不足
+                  summary: G1 — confidence 不足（L1）
                   value:
                     gate: "G1"
                     reason: "confidence 0.63 < 0.8"
+                    confidence: 0.63
                     action: "标记 BLOCKED，等待人工确认题目理解"
+                    level: "L1"
                 g3_missing_intuition:
-                  summary: G3 — 缺直觉解释
+                  summary: G3 — 缺直觉解释（L1）
                   value:
                     gate: "G3"
                     reason: "intuition_explanation 为空"
                     action: "补充函数结果的直觉解释后重新提交（R5）"
+                    level: "L1"
+                g4_verification_failed:
+                  summary: G4 — 验证用例未通过（L1）
+                  value:
+                    gate: "G4"
+                    reason: "2 个验证用例未通过"
+                    action: "修正推导后重新验证"
+                    level: "L1"
+                stage_mismatch:
+                  summary: ORIENT 阶段应用 /approve
+                  value:
+                    code: "STAGE_MISMATCH"
+                    message: "ORIENT 阶段请使用 /approve 接口（G2 是人工门禁）"
         "404":
           $ref: "#/components/responses/NotFound"
-
-  # ─────────────────────────────────────────
-  # 人工审批（G2 专用）
-  # ─────────────────────────────────────────
 
   /jobs/{job_id}/approve:
     post:
       operationId: approveOrient
-      summary: 人工审批 G2——判断 ORIENT 选定路径是否有直觉性依据（P1）
+      summary: 人工审批 G2（L3）——判断 ORIENT 路径是否有直觉性依据
       description: |
-        G2 是本引擎唯一的人工 Gate。
+        G2 是本引擎唯一的 L3 人工 Gate（shortanswer profile 跳过此步骤）。
 
-        审批人判断 ORIENT 产出物中 selected_path 的 intuition_basis 是否满足 P1：
-        - **通过**：路径有几何类比 / 直觉描述 → 推进到 SOLVE
-        - **拒绝**：路径是纯公式推导，缺乏直觉 → 退回 ORIENT，等待修订
+        审批人判断 `selected_path` 的 `intuition_basis` 是否满足 P1：
+        - **通过（approved=true）**：路径有几何类比/直觉描述 → 推进到 SOLVE
+        - **拒绝（approved=false）**：路径缺乏直觉 → 退回 ORIENT，等待修订
 
-        典型通过案例：「半圆垂线 ≤ 半径，几何事实直接给出结论」
-        典型拒绝案例：「令 f(x)=ln x，f''(x)<0，调用 Jensen 不等式」（机械，无直觉）
+        两种结果都写入 DynamoDB DISTILL# 分区（G2_PASSED / G2_REJECTED）。
+
+        典型通过：「半圆垂线 ≤ 半径，几何事实直接给出结论」
+        典型拒绝：「令 f(x)=ln x，调用 Jensen 不等式」（机械，无直觉）
       tags: [Stage]
       parameters:
         - $ref: "#/components/parameters/JobId"
@@ -180,31 +294,30 @@ paths:
                 value:
                   approved: false
                   reviewer_id: "teacher-001"
-                  comment: "路径 A 是纯公式，退回修订"
+                  comment: "路径 A 是纯公式，缺直觉，退回修订"
       responses:
         "200":
-          description: 审批完成（通过 → SOLVE，拒绝 → 回 ORIENT）
+          description: 审批完成（通过→SOLVE，拒绝→回ORIENT）
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Job"
         "409":
-          description: 当前阶段不是 ORIENT 或不处于 waiting_approval 状态
+          description: Job 当前不在 waiting_approval 状态
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+              example:
+                code: "INVALID_APPROVAL_STATE"
+                message: "Job 当前状态是 running，不在等待审批"
         "404":
           $ref: "#/components/responses/NotFound"
-
-  # ─────────────────────────────────────────
-  # 产出物
-  # ─────────────────────────────────────────
 
   /jobs/{job_id}/artifacts/{stage}:
     get:
       operationId: getArtifact
-      summary: 获取指定阶段的产出物
+      summary: 获取指定阶段的产出物（payload + gate 记录）
       tags: [Artifact]
       parameters:
         - $ref: "#/components/parameters/JobId"
@@ -213,18 +326,16 @@ paths:
           required: true
           schema:
             $ref: "#/components/schemas/Stage"
+          example: "SOLVE"
       responses:
         "200":
+          description: 阶段产出物
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Artifact"
         "404":
           $ref: "#/components/responses/NotFound"
-
-# ─────────────────────────────────────────
-# Components
-# ─────────────────────────────────────────
 
 components:
 
@@ -242,25 +353,45 @@ components:
     Stage:
       type: string
       enum: [UNDERSTAND, ORIENT, SOLVE, VERIFY, DONE, BLOCKED]
+      description: |
+        - UNDERSTAND: Bedrock 分析题目（自动）
+        - ORIENT: 选择解题路径（等待G2审批）
+        - SOLVE: 逐步推导（G3自动校验）
+        - VERIFY: 验证结果（G4自动校验）
+        - DONE: 解答完成，可交付
+        - BLOCKED: Gate 失败（L1），等待人工介入
 
     JobStatus:
       type: string
       enum: [running, waiting_approval, blocked, done]
       description: |
-        - running: 当前阶段自动处理中或等待 advance
-        - waiting_approval: ORIENT 完成，等待 G2 人工审批
-        - blocked: G1 confidence < 0.8，等待人工确认题目理解
-        - done: G4 通过，解答可交付
+        - running: 当前阶段处理中或等待 advance
+        - waiting_approval: ORIENT完成，等待G2人工审批（L3）
+        - blocked: G1/G3/G4 L1失败，等待人工介入
+        - done: G4通过（含L2警告通过），解答可交付
+
+    GateLevel:
+      type: string
+      enum: [L1, L2, L3]
+      description: |
+        - L1: 硬阻断，Job进入BLOCKED
+        - L2: 软警告，Job继续推进，distill记录warning事件
+        - L3: 人工介入，Job进入WAITING_APPROVAL
 
     Job:
       type: object
-      required: [job_id, status, current_stage, created_at]
+      required: [job_id, problem, status, current_stage, created_at, updated_at]
       properties:
         job_id:
           type: string
+          example: "job-abc123"
         problem:
           type: string
           description: 原始题目文本
+        problem_type:
+          type: string
+          description: 题目类型，决定 Profile 和阶段路径
+          enum: [algebra, geometry, function, inequality_proof, combinatorics, shortanswer, other]
         status:
           $ref: "#/components/schemas/JobStatus"
         current_stage:
@@ -269,6 +400,7 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/GateRecord"
+          description: 已通过/失败的 Gate 记录，按时间顺序
         created_at:
           type: string
           format: date-time
@@ -278,6 +410,7 @@ components:
 
     GateRecord:
       type: object
+      required: [gate, type, result, checked_at]
       properties:
         gate:
           type: string
@@ -287,17 +420,18 @@ components:
           enum: [auto, manual]
         result:
           type: string
-          enum: [passed, failed]
+          enum: [passed, failed, warning]
+          description: warning 表示 L2 降级（通过但有警告）
         reviewer_id:
           type: string
-          description: G2 专用
+          nullable: true
+          description: G2 专用，其他 Gate 为 null
         comment:
           type: string
+          nullable: true
         checked_at:
           type: string
           format: date-time
-
-    # ── 请求体 ──
 
     CreateJobRequest:
       type: object
@@ -305,11 +439,18 @@ components:
       properties:
         problem:
           type: string
-          description: 题目文本（已识别为文字，非图片）
+          minLength: 1
+          description: 题目文本
+          example: "证明 ln((a+b)/2) ≥ (ln a + ln b)/2，其中 a, b > 0"
         problem_type:
           type: string
-          enum: [algebra, geometry, function, inequality_proof, combinatorics, other]
+          enum: [algebra, geometry, function, inequality_proof, combinatorics, shortanswer, other]
           default: other
+          description: |
+            决定解题 Profile：
+            - inequality_proof/combinatorics/geometry → proof（需G2审批）
+            - algebra/function/other → calculation（需G2审批）
+            - shortanswer → 跳过ORIENT/G2，直接SOLVE
 
     AdvanceRequest:
       type: object
@@ -317,25 +458,25 @@ components:
       properties:
         stage:
           $ref: "#/components/schemas/Stage"
-          description: 当前要提交产出物的阶段（用于校验防错）
+          description: 当前阶段（用于防错校验）
         payload:
           $ref: "#/components/schemas/StagePayload"
 
     ApproveRequest:
       type: object
-      required: [approved, reviewer_id]
+      required: [approved]
       properties:
         approved:
           type: boolean
         reviewer_id:
           type: string
+          nullable: true
         comment:
           type: string
-
-    # ── 各阶段产出物 ──
+          nullable: true
 
     StagePayload:
-      description: 按 stage 解释对应字段
+      description: 由 stage 字段区分类型（discriminator）
       oneOf:
         - $ref: "#/components/schemas/UnderstandPayload"
         - $ref: "#/components/schemas/OrientPayload"
@@ -343,6 +484,11 @@ components:
         - $ref: "#/components/schemas/VerifyPayload"
       discriminator:
         propertyName: stage
+        mapping:
+          UNDERSTAND: "#/components/schemas/UnderstandPayload"
+          ORIENT: "#/components/schemas/OrientPayload"
+          SOLVE: "#/components/schemas/SolvePayload"
+          VERIFY: "#/components/schemas/VerifyPayload"
 
     UnderstandPayload:
       type: object
@@ -353,19 +499,22 @@ components:
           enum: [UNDERSTAND]
         problem_type:
           type: string
+          description: Bedrock 识别的题目类型
         known_conditions:
           type: array
           items:
             type: string
           minItems: 1
+          description: 已知条件列表
         solve_goal:
           type: string
-          description: "G1 校验：非空，用一句话说清楚求什么"
+          minLength: 1
+          description: "G1 校验：用一句话说清楚求什么"
         confidence:
           type: number
           minimum: 0
           maximum: 1
-          description: "G1 校验：< 0.8 → BLOCKED"
+          description: "G1 校验：< 0.8 → BLOCKED（L1）"
 
     OrientPayload:
       type: object
@@ -379,12 +528,14 @@ components:
           minItems: 2
           items:
             $ref: "#/components/schemas/CandidatePath"
-          description: 至少给出 2 条路径
+          description: 至少提供 2 条候选路径
         selected_path_id:
           type: string
+          description: 选定的路径 ID
         selection_rationale:
           type: string
-          description: "G2 人工校验：为什么选这条路径，必须有直觉性描述（P1）"
+          minLength: 1
+          description: "G2 人工校验：为什么选这条路径，必须包含直觉性描述（P1）"
 
     SolvePayload:
       type: object
@@ -400,9 +551,11 @@ components:
             $ref: "#/components/schemas/SolveStep"
         final_result:
           type: string
+          description: 最终结论
         intuition_explanation:
           type: string
-          description: "G3 校验：非空，说清楚'为什么是这个结果'（R5）"
+          minLength: 1
+          description: "G3 校验（L1）：说清楚'为什么是这个结果'，不能为空或纯空白（R5）"
 
     VerifyPayload:
       type: object
@@ -416,6 +569,7 @@ components:
           minItems: 1
           items:
             $ref: "#/components/schemas/VerificationCase"
+          description: "G4 校验（L1）：至少 1 个验证用例，所有 passed=true"
         quality_check:
           $ref: "#/components/schemas/QualityCheck"
 
@@ -425,11 +579,14 @@ components:
       properties:
         path_id:
           type: string
+          example: "p1"
         description:
           type: string
+          description: 路径的技术描述
         intuition_basis:
           type: string
-          description: 几何类比 / 直觉描述，不能为空字符串（P1）
+          minLength: 1
+          description: "几何类比/直觉描述，不能为空（P1）"
 
     SolveStep:
       type: object
@@ -437,11 +594,14 @@ components:
       properties:
         step:
           type: integer
+          minimum: 1
         expression:
           type: string
+          description: 数学表达式或推导语句
         reason:
           type: string
-          description: 这一步的直觉解释，禁止空字符串
+          minLength: 1
+          description: "G3 校验：这一步的直觉解释，禁止空字符串"
 
     VerificationCase:
       type: object
@@ -449,15 +609,20 @@ components:
       properties:
         method:
           type: string
-          enum: [special_value, boundary, reverse]
+          description: 验证方法（special_value / boundary / reverse / contradiction / numerical 等）
+          example: "special_value"
         input:
           type: string
+          description: 验证输入
         expected:
           type: string
+          description: 期望结果
         actual:
           type: string
+          description: 实际结果
         passed:
           type: boolean
+          description: "G4 L1：任意 false → Gate 失败"
 
     QualityCheck:
       type: object
@@ -465,17 +630,18 @@ components:
       properties:
         has_intuition:
           type: boolean
-          description: "G4 校验：解析中有几何 / 类比 / 直觉描述（R001）"
+          description: "G4 L1：解析中有几何/类比/直觉描述（R001），false → BLOCKED"
         has_story:
           type: boolean
-          description: "加分项：解析有叙事感（R4），非必须"
+          default: false
+          description: "G4 L2：解析有叙事感（R4），false → 警告继续（不阻断）"
         all_verifications_passed:
           type: boolean
-
-    # ── 产出物封装 ──
+          description: 是否所有验证用例通过（应与 verification_cases 保持一致）
 
     Artifact:
       type: object
+      description: 指定阶段的产出物（从 DynamoDB ARTIFACT#{stage} 读取）
       properties:
         job_id:
           type: string
@@ -483,36 +649,46 @@ components:
           $ref: "#/components/schemas/Stage"
         payload:
           $ref: "#/components/schemas/StagePayload"
-        gate_result:
-          $ref: "#/components/schemas/GateRecord"
         created_at:
           type: string
           format: date-time
 
     GateFailure:
       type: object
-      required: [gate, reason, action]
+      required: [gate, reason, action, level]
+      description: Gate 校验失败时的响应体（HTTP 409）
       properties:
         gate:
           type: string
           enum: [G1, G2, G3, G4]
         reason:
           type: string
+          description: 失败原因
         confidence:
           type: number
-          description: G1 失败时附带实际值
+          nullable: true
+          description: G1 失败时附带实际 confidence 值
         action:
           type: string
           description: 建议的修复动作
+        level:
+          $ref: "#/components/schemas/GateLevel"
+          description: L1=阻断，L2=警告（通过），L3=人工介入
 
     ErrorResponse:
       type: object
       required: [code, message]
+      description: 通用错误响应
       properties:
         code:
           type: string
+          enum: [JOB_NOT_FOUND, STAGE_MISMATCH, GATE_FAILED, INVALID_APPROVAL_STATE, BEDROCK_ERROR, INTERNAL_ERROR]
         message:
           type: string
+        detail:
+          type: object
+          nullable: true
+          additionalProperties: true
 
   responses:
     NotFound:
@@ -521,8 +697,11 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+          example:
+            code: "JOB_NOT_FOUND"
+            message: "Job job-abc123 不存在"
     ValidationError:
-      description: 请求参数不合法
+      description: 请求参数不合法（Pydantic 校验失败）
       content:
         application/json:
           schema:
@@ -530,8 +709,8 @@ components:
 
 tags:
   - name: Job
-    description: 解题 Job 生命周期
+    description: 解题 Job 生命周期（创建、查询、列表）
   - name: Stage
-    description: 阶段推进和 Gate 校验
+    description: 阶段推进和 Gate 校验（advance/approve）
   - name: Artifact
-    description: 各阶段产出物
+    description: 各阶段产出物查询

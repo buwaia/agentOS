@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Math Solver Delivery Engine
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Environment:
+      Variables:
+        DYNAMODB_TABLE: !Ref JobsTable
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        CONFIDENCE_THRESHOLD: "0.8"
+        AWS_DEFAULT_REGION: !Ref AWS::Region
+
+Parameters:
+  BedrockModelId:
+    Type: String
+    Default: "anthropic.claude-sonnet-4-6"
+
+Resources:
+
+  # ── DynamoDB ──────────────────────────────────────────────────────────────
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: delivery-engine-jobs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+
+  # ── IAM Role: DynamoDB only (shared by 4 handlers) ────────────────────────
+  LambdaBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource: !GetAtt JobsTable.Arn
+
+  # ── IAM Role: DynamoDB + Bedrock (create-job only) ────────────────────────
+  CreateJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAndBedrock
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource: !GetAtt JobsTable.Arn
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+
+  # ── API Gateway ────────────────────────────────────────────────────────────
+  DeliveryEngineApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - "*"
+
+  # ── Lambda Functions ───────────────────────────────────────────────────────
+  CreateJobFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/app.handler
+      CodeUri: .
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt CreateJobRole.Arn
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DeliveryEngineApi
+            Method: POST
+            Path: /jobs
+
+  GetJobFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/app.handler
+      CodeUri: .
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt LambdaBaseRole.Arn
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DeliveryEngineApi
+            Method: GET
+            Path: /jobs/{job_id}
+
+  AdvanceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/app.handler
+      CodeUri: .
+      MemorySize: 256
+      Timeout: 60
+      Role: !GetAtt LambdaBaseRole.Arn
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DeliveryEngineApi
+            Method: POST
+            Path: /jobs/{job_id}/advance
+
+  ApproveFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/app.handler
+      CodeUri: .
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt LambdaBaseRole.Arn
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DeliveryEngineApi
+            Method: POST
+            Path: /jobs/{job_id}/approve
+
+  GetArtifactFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/app.handler
+      CodeUri: .
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt LambdaBaseRole.Arn
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DeliveryEngineApi
+            Method: GET
+            Path: /jobs/{job_id}/artifacts/{stage}
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint
+    Value: !Sub "https://${DeliveryEngineApi}.execute-api.${AWS::Region}.amazonaws.com"
+  JobsTableName:
+    Description: DynamoDB table name
+    Value: !Ref JobsTable

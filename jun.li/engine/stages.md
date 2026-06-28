@@ -1,4 +1,4 @@
-好的# Delivery Engine — Stages（数学解题）
+# Delivery Engine — Stages（数学解题）
 
 ## 阶段序列
 UNDERSTAND → ORIENT → SOLVE → VERIFY

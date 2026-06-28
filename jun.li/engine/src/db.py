@@ -21,12 +21,13 @@ def get_job(job_id: str) -> dict | None:
     return result.get("Item")
 
 
-def put_job_meta(job_id: str, problem: str, status: str, stage: str, created_at: str) -> None:
+def put_job_meta(job_id: str, problem: str, status: str, stage: str, created_at: str, problem_type: str = "other") -> None:
     _table().put_item(Item={
         "PK": f"JOB#{job_id}",
         "SK": "META",
         "job_id": job_id,
         "problem": problem,
+        "problem_type": problem_type,
         "status": status,
         "current_stage": stage,
         "created_at": created_at,

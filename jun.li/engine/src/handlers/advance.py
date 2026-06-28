@@ -2,7 +2,8 @@ from datetime import date as _date, datetime, timezone
 from fastapi import APIRouter, HTTPException
 from src.models import AdvanceRequest, Job, Stage
 from src.db import get_job, put_artifact, update_job_stage, put_gate_record, put_distill_event
-from src.state_machine import next_stage_after_advance, GateFailedException
+from src.models import GateLevel
+from src.state_machine import next_stage_after_advance, GateFailedException, g1_next_stage
 
 router = APIRouter()
 
@@ -31,25 +32,44 @@ def advance_stage(job_id: str, req: AdvanceRequest):
             detail={"code": "STAGE_MISMATCH", "message": "ORIENT 阶段请使用 /approve 接口（G2 是人工门禁）"},
         )
 
+    problem_type = item.get("problem_type", "other")
     try:
-        new_stage, new_status = next_stage_after_advance(Stage(current), req.payload)
+        new_stage, new_status = next_stage_after_advance(Stage(current), req.payload, problem_type)
     except GateFailedException as e:
-        # 写失败蒸馏事件
+        gate_name = GATE_MAP.get(current, current)
+        is_l2 = e.failure.level == GateLevel.L2
         try:
             from src.db import get_artifact as _ga
             ua = _ga(job_id, "UNDERSTAND")
             put_distill_event(
                 date=_date.today().isoformat(),
                 job_id=job_id,
-                event=f"{GATE_MAP.get(current, current)}_FAILED",
+                event=f"{gate_name}_{'WARNING' if is_l2 else 'FAILED'}",
                 payload={
                     "problem_type": (ua.get("payload", {}) if ua else {}).get("problem_type", "unknown"),
-                    "gate": GATE_MAP.get(current),
+                    "gate": gate_name,
                     "reason": e.failure.reason,
+                    "level": e.failure.level.value,
                 },
             )
         except Exception:
             pass
+        if is_l2:
+            # L2 warning: continue to next stage, record warning gate
+            gate = GATE_MAP.get(current)
+            put_artifact(job_id, current, req.payload.model_dump(), now)
+            update_job_stage(job_id, current, Stage.DONE.value, "done", now)
+            if gate:
+                put_gate_record(job_id, gate, {
+                    "gate": gate, "type": "auto", "result": "warning",
+                    "comment": e.failure.reason, "checked_at": now,
+                })
+            item = get_job(job_id)
+            return Job(
+                job_id=item["job_id"], problem=item["problem"],
+                status=item["status"], current_stage=item["current_stage"],
+                created_at=item["created_at"], updated_at=item["updated_at"],
+            )
         raise HTTPException(status_code=409, detail=e.failure.model_dump())
     except ValueError as e:
         raise HTTPException(
