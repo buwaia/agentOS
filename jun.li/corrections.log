@@ -1,0 +1,14 @@
+CORRECTION: 前端刷新后 jobs 数据消失——App.jsx 没有 useEffect 初始加载
+CORRECTION: CloudFront 代理页面打不开——Vite HMR 硬编码 localhost:3000，改为 hmr:false
+CORRECTION: GET /jobs 返回 404——缺少 list_jobs handler，需要新建
+CORRECTION: api 未定义——App.jsx 缺少 import { api } from "./services/api"
+CORRECTION: gate_history 始终为空——get_job 只读 META SK，需单独 query GATE# 前缀
+CORRECTION: 本次设计不是错题本，是数学解题通俗解法引擎——需更新 PRODUCT.md
+CORRECTION: moto mock 重启后数据丢失——改用真实 DynamoDB DeliveryEngineLocal
+CORRECTION: G3 whitespace 绕过——min_length=1 允许空白字符，check_g3 未用 strip()
+DECISION: DynamoDB 单表设计，PK=JOB#id，SK=META/ARTIFACT#/GATE#/DISTILL# 分区隔离
+DECISION: G4 has_story=false 降为 L2 警告，不阻断，distill 写 warning 事件
+DECISION: shortanswer profile 跳过 ORIENT/G2，problem_type 决定路径
+DECISION: DISTILL# 独立分区，/drishti 扫描时按日期 query 无需知道 job_id
+DISCOVERY: Pydantic Union 无 discriminator 时按顺序匹配，stage 字段被忽略
+DISCOVERY: 生产部署时 .claude/ 文件留在开发机，engine/src/ 部署到 Lambda，rules 进系统 prompt 或 DynamoDB CONFIG#
